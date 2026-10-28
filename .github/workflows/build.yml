@@ -24,12 +24,16 @@ jobs:
     # Free for public repositories. Has Xcode 27.1, the version Swiftgram pins in versions.json.
     runs-on: xcode-27
     timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash mod/ci_step.sh {0}
 
     steps:
       - name: Check secrets
         env:
           API_ID: ${{ secrets.TELEGRAM_API_ID }}
           API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        shell: bash
         run: |
           if [ -z "$API_ID" ] || [ -z "$API_HASH" ]; then
             echo "::error::Add TELEGRAM_API_ID and TELEGRAM_API_HASH in Settings > Secrets and variables > Actions"
@@ -84,7 +88,7 @@ jobs:
           BUNDLE_ID_OVERRIDE: ${{ vars.BUNDLE_ID }}
         run: |
           OWNER="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
-          BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-io.lumigram.$OWNER}"
+          export BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-io.lumigram.$OWNER}"
           echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
           echo "Bundle ID: $BUNDLE_ID"
 
@@ -173,17 +177,6 @@ jobs:
           path: ${{ env.SOURCE_DIR }}/build/artifacts/Lumigram.ipa
           retention-days: 30
           compression-level: 0
-
-      # Annotations of a public repo can be read without signing in, so build errors are visible from outside.
-      - name: Report build errors
-        if: failure() && steps.build.outcome == 'failure'
-        run: |
-          LOG="$RUNNER_TEMP/build.log"
-          [ -f "$LOG" ] || exit 0
-          { grep -E "(error:|ERROR:|FAILED:|fatal:)" "$LOG" | grep -v "^INFO" | head -9; tail -n 3 "$LOG"; } | while IFS= read -r line; do
-            line="${line//'%'/'%25'}"
-            echo "::error::${line:0:900}"
-          done
 
       - name: Upload build log
         if: failure()
