@@ -115,8 +115,6 @@ jobs:
           EOF
 
           bash mod/make_codesigning.sh "$RUNNER_TEMP/lumigram/codesigning" "$TEAM_ID" "$BUNDLE_ID"
-          cd "$SOURCE_DIR"
-          python3 build-system/Make/ImportCertificates.py --path "$RUNNER_TEMP/lumigram/codesigning/certs"
 
       - name: Restore Bazel cache
         uses: actions/cache/restore@v4

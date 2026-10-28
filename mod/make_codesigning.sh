@@ -36,8 +36,11 @@ EOF
 "$OPENSSL" req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -config "$WORK/cert.cnf"
 "$OPENSSL" x509 -in "$WORK/cert.pem" -outform der -out "$OUT/certs/Public.cer"
+P12_PASSWORD=lumigram
+# 3DES/SHA1 is the PKCS#12 flavour `security import` reliably accepts.
 "$OPENSSL" pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
-    -out "$OUT/certs/SelfSigned.p12" -passout pass:
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 \
+    -out "$WORK/SelfSigned.p12" -passout pass:$P12_PASSWORD
 
 CERT_B64="$(base64 < "$OUT/certs/Public.cer" | tr -d '\n')"
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -97,6 +100,17 @@ EOF
 "$OPENSSL" smime -sign -binary -nodetach -outform der \
     -signer "$WORK/cert.pem" -inkey "$WORK/key.pem" \
     -in "$WORK/profile.plist" -out "$OUT/profiles/Telegram.mobileprovision"
+
+KEYCHAIN=lumigram.keychain
+KEYCHAIN_PASSWORD=lumigram
+security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+security set-keychain-settings "$KEYCHAIN"
+security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+security import "$WORK/SelfSigned.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -A -T /usr/bin/codesign -T /usr/bin/security
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+security find-identity -p codesigning "$KEYCHAIN" | tee /dev/stderr | grep -qE "[0-9A-F]{40}" || { echo "make_codesigning: error: identity was not imported"; exit 1; }
 
 rm -rf "$WORK"
 security cms -D -i "$OUT/profiles/Telegram.mobileprovision" > /dev/null
