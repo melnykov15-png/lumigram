@@ -1,0 +1,183 @@
+name: Build Lumigram
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "mod/**"
+      - ".github/workflows/build.yml"
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  SOURCE_DIR: /Users/Shared/telegram-ios
+  BAZEL_CACHE_DIR: /Users/Shared/bazel-cache
+  BAZEL_USER_ROOT: /private/var/tmp/_bazel_lumigram
+  TEAM_ID: LUMIGRAM00
+  BUILD_CONFIGURATION: release_arm64
+
+jobs:
+  build:
+    # Free for public repositories. Has Xcode 27.1, the version Swiftgram pins in versions.json.
+    runs-on: xcode-27
+    timeout-minutes: 360
+
+    steps:
+      - name: Check secrets
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          if [ -z "$API_ID" ] || [ -z "$API_HASH" ]; then
+            echo "::error::Add TELEGRAM_API_ID and TELEGRAM_API_HASH in Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+
+      - name: Check out the mod
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          df -h /
+          for app in /Applications/Xcode_*.app; do
+            case "$(readlink -f "$app" || echo "$app")" in
+              */Xcode_27.1.app) ;;
+              *) [ -L "$app" ] || sudo rm -rf "$app" ;;
+            esac
+          done
+          xcrun simctl runtime delete all >/dev/null 2>&1 || true
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet ~/.dotnet ~/Library/Developer/CoreSimulator/Caches \
+            /usr/local/lib/node_modules ~/.rustup ~/.cargo ~/hostedtoolcache /Users/runner/hostedtoolcache || true
+          df -h /
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Fetch Swiftgram source
+        run: |
+          set -x
+          UPSTREAM_COMMIT="$(cat mod/UPSTREAM_COMMIT)"
+          sudo mkdir -p "$SOURCE_DIR" && sudo chown "$(whoami)" "$SOURCE_DIR"
+          cd "$SOURCE_DIR"
+          git init -q
+          git remote add origin https://github.com/Swiftgram/Telegram-iOS.git
+          git fetch --depth 1 origin "$UPSTREAM_COMMIT"
+          git checkout -q FETCH_HEAD
+          if ! git submodule update --init --recursive --depth 1 --jobs 8; then
+            git submodule update --init --recursive --jobs 8
+          fi
+          du -sh "$SOURCE_DIR"
+          df -h /
+
+      - name: Apply the mod
+        run: python3 mod/apply_mod.py "$SOURCE_DIR"
+
+      - name: Prepare configuration and codesigning
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          BUNDLE_ID_OVERRIDE: ${{ vars.BUNDLE_ID }}
+        run: |
+          OWNER="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
+          BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-io.lumigram.$OWNER}"
+          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+          echo "Bundle ID: $BUNDLE_ID"
+
+          mkdir -p "$RUNNER_TEMP/lumigram"
+          python3 - "$RUNNER_TEMP/lumigram/configuration.json" <<'EOF'
+          import json, os, sys
+          config = {
+              "sg_config": "",
+              "bundle_id": os.environ["BUNDLE_ID"],
+              "api_id": os.environ["API_ID"].strip(),
+              "api_hash": os.environ["API_HASH"].strip(),
+              "team_id": os.environ["TEAM_ID"],
+              "app_center_id": "0",
+              "is_internal_build": "false",
+              "is_appstore_build": "false",
+              "appstore_id": "0",
+              "app_specific_url_scheme": "tg",
+              "premium_iap_product_id": "",
+              "enable_siri": False,
+              "enable_icloud": False,
+          }
+          with open(sys.argv[1], "w") as f:
+              json.dump(config, f)
+          EOF
+
+          bash mod/make_codesigning.sh "$RUNNER_TEMP/lumigram/codesigning" "$TEAM_ID" "$BUNDLE_ID"
+          cd "$SOURCE_DIR"
+          python3 build-system/Make/ImportCertificates.py --path "$RUNNER_TEMP/lumigram/codesigning/certs"
+
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BAZEL_CACHE_DIR }}
+          key: bazel-${{ env.BUILD_CONFIGURATION }}-${{ hashFiles('mod/UPSTREAM_COMMIT') }}-${{ github.run_id }}
+          restore-keys: |
+            bazel-${{ env.BUILD_CONFIGURATION }}-${{ hashFiles('mod/UPSTREAM_COMMIT') }}-
+            bazel-${{ env.BUILD_CONFIGURATION }}-
+
+      - name: Build
+        id: build
+        # Leaves time to save the cache, so a build that runs out of time still speeds up the next one.
+        timeout-minutes: 300
+        run: |
+          cd "$SOURCE_DIR"
+          BUILD_NUMBER="$(( $(cat build_number_offset) + ${{ github.run_number }} ))"
+          python3 -u build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --cacheDir="$BAZEL_CACHE_DIR" \
+            build \
+            --configurationPath="$RUNNER_TEMP/lumigram/configuration.json" \
+            --codesigningInformationPath="$RUNNER_TEMP/lumigram/codesigning" \
+            --configuration="$BUILD_CONFIGURATION" \
+            --buildNumber="$BUILD_NUMBER" \
+            --outputBuildArtifactsPath="$SOURCE_DIR/build/artifacts" \
+            2>&1 | tee "$RUNNER_TEMP/build.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Trim Bazel cache
+        if: always() && steps.build.outcome != 'skipped'
+        run: |
+          python3 mod/trim_cache.py "$BAZEL_CACHE_DIR" 7.5
+          df -h /
+
+      - name: Upload Bazel cache
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.BAZEL_CACHE_DIR }}
+          key: bazel-${{ env.BUILD_CONFIGURATION }}-${{ hashFiles('mod/UPSTREAM_COMMIT') }}-${{ github.run_id }}
+
+      - name: Package IPA
+        run: |
+          cd "$SOURCE_DIR/build/artifacts"
+          mv Swiftgram.ipa Lumigram.ipa
+          unzip -l Lumigram.ipa | grep -E "Payload/[^/]+\.app/Info.plist" || { echo "IPA has no app"; exit 1; }
+          if unzip -l Lumigram.ipa | grep -q "PlugIns/"; then
+            echo "::warning::IPA contains app extensions; a free Apple ID may reject them"
+          fi
+          ls -lh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lumigram-ipa
+          path: ${{ env.SOURCE_DIR }}/build/artifacts/Lumigram.ipa
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+          retention-days: 14
